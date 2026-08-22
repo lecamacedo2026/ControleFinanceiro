@@ -1,11 +1,13 @@
 import os
+import io
+import csv
 import sqlite3
 from datetime import date
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 DATA_DIR = os.getenv("RENDER_DISK_PATH", ".")
 DB_NAME = os.path.join(DATA_DIR, "controle_financeiro.db")
@@ -13,7 +15,7 @@ DB_NAME = os.path.join(DATA_DIR, "controle_financeiro.db")
 app = FastAPI(title="Agente Financeiro IA")
 
 # ==========================================
-# 1. BANCO DE DADOS
+# 1. BANCO DE DADOS E INICIALIZAÇÃO
 # ==========================================
 
 def init_db() -> None:
@@ -48,7 +50,7 @@ def init_db() -> None:
 init_db()
 
 # ==========================================
-# 2. FERRAMENTAS DO AGENTE (FUNCTIONS)
+# 2. FERRAMENTAS E MÉTODOS OPERACIONAIS
 # ==========================================
 
 def consultar_controle(
@@ -148,15 +150,36 @@ def calcular_saldo_final(
     except sqlite3.Error as e:
         return {"status": "erro", "mensagem": str(e)}
 
+
+def relatorio_por_categoria(tipo_filtro: str = 'despesa') -> List[Dict[str, Any]]:
+    """Gera o total consolidado agrupando por descrição para um determinado tipo."""
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT descricao, SUM(valor) as total, COUNT(*) as qtd
+                FROM Valores
+                WHERE tipo = ?
+                GROUP BY LOWER(descricao)
+                ORDER BY total DESC;
+            """, (tipo_filtro.lower(),))
+            return [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        print(f"Erro no relatório: {e}")
+        return []
+
 # ==========================================
-# 3. INTERFACE WEB
+# 3. ROTAS E INTERFACE WEB
 # ==========================================
 
 @app.get("/", response_class=HTMLResponse)
 def home_ui():
     registros = consultar_controle()
     resumo = calcular_saldo_final()
+    relatorio_despesas = relatorio_por_categoria('despesa')
     
+    # Tabela principal de lançamentos
     linhas_tabela = ""
     for r in registros:
         cor_badge = "bg-success" if r['tipo'] == 'receita' else "bg-danger"
@@ -171,6 +194,17 @@ def home_ui():
         </tr>
         """
 
+    # Tabela do relatório por tipo de despesa
+    linhas_relatorio = ""
+    for item in relatorio_despesas:
+        linhas_relatorio += f"""
+        <tr>
+            <td>{item['descricao']}</td>
+            <td>{item['qtd']}</td>
+            <td>R$ {item['total']:.2f}</td>
+        </tr>
+        """
+
     html_content = f"""
     <!DOCTYPE html>
     <html lang="pt-br">
@@ -182,11 +216,15 @@ def home_ui():
     </head>
     <body class="bg-light">
         <div class="container py-5">
-            <h2 class="mb-4 text-center">📊 Sistema de Controle Financeiro</h2>
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h2>📊 Sistema de Controle Financeiro</h2>
+                <a href="/exportar-csv" class="btn btn-outline-success">📥 Exportar para CSV</a>
+            </div>
             
+            <!-- Cards de Saldo -->
             <div class="row mb-4">
                 <div class="col-md-4">
-                    <div class="card text-white bg-success mb-3">
+                    <div class="card text-white bg-success mb-3 shadow-sm">
                         <div class="card-body">
                             <h5 class="card-title">Receitas Totais</h5>
                             <h3>R$ {resumo['total_receita']:.2f}</h3>
@@ -194,7 +232,7 @@ def home_ui():
                     </div>
                 </div>
                 <div class="col-md-4">
-                    <div class="card text-white bg-danger mb-3">
+                    <div class="card text-white bg-danger mb-3 shadow-sm">
                         <div class="card-body">
                             <h5 class="card-title">Despesas Totais</h5>
                             <h3>R$ {resumo['total_despesa']:.2f}</h3>
@@ -202,7 +240,7 @@ def home_ui():
                     </div>
                 </div>
                 <div class="col-md-4">
-                    <div class="card text-white bg-primary mb-3">
+                    <div class="card text-white bg-primary mb-3 shadow-sm">
                         <div class="card-body">
                             <h5 class="card-title">Saldo Final</h5>
                             <h3>R$ {resumo['saldo_final']:.2f}</h3>
@@ -211,13 +249,14 @@ def home_ui():
                 </div>
             </div>
 
+            <!-- Formulário de Cadastro -->
             <div class="card mb-4 shadow-sm">
                 <div class="card-header bg-white"><strong>Novo Lançamento</strong></div>
                 <div class="card-body">
                     <form action="/adicionar" method="post" class="row g-3">
                         <div class="col-md-5">
                             <label class="form-label">Descrição</label>
-                            <input type="text" name="descricao" class="form-control" placeholder="Ex: Mercado, Salário..." required>
+                            <input type="text" name="descricao" class="form-control" placeholder="Ex: Mercado, Aluguel..." required>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">Valor (R$)</label>
@@ -240,8 +279,28 @@ def home_ui():
                 </div>
             </div>
 
+            <!-- Relatório Agrupado por Tipo de Despesa -->
+            <div class="card mb-4 shadow-sm">
+                <div class="card-header bg-white"><strong>📉 Relatório Consolidação por Categoria de Despesa</strong></div>
+                <div class="card-body p-0">
+                    <table class="table table-hover mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Descrição / Categoria</th>
+                                <th>Quantidade de Lançamentos</th>
+                                <th>Total Acumulado</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {linhas_relatorio if linhas_relatorio else "<tr><td colspan='3' class='text-center text-muted'>Nenhuma despesa registrada.</td></tr>"}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Tabela Geral de Extrato -->
             <div class="card shadow-sm">
-                <div class="card-header bg-white"><strong>Extrato por Período</strong></div>
+                <div class="card-header bg-white"><strong>Extrato Completo</strong></div>
                 <div class="card-body p-0">
                     <table class="table table-striped mb-0">
                         <thead>
@@ -270,3 +329,27 @@ def home_ui():
 def adicionar_registro(descricao: str = Form(...), valor: float = Form(...), tipo: str = Form(...)):
     calculo(descricao=descricao, tipo=tipo, valor=Decimal(str(valor)))
     return HTMLResponse(content="<script>window.location.href='/';</script>")
+
+
+@app.get("/exportar-csv")
+def exportar_csv():
+    """Gera e faz o download automático de um arquivo CSV contendo todo o histórico."""
+    registros = consultar_controle()
+    
+    stream = io.StringIO()
+    writer = csv.writer(stream, delimiter=';')
+    
+    # Cabeçalho do arquivo CSV
+    writer.writerow(["ID", "Data", "Descricao", "Tipo", "Valor (R$)"])
+    
+    for r in registros:
+        writer.writerow([r['id'], r['data'], r['descricao'], r['tipo'], f"{r['valor']:.2f}".replace('.', ',')])
+        
+    stream.seek(0)
+    
+    response = StreamingResponse(
+        iter([stream.getvalue()]),
+        media_type="text/csv"
+    )
+    response.headers["Content-Disposition"] = "attachment; filename=extrato_financeiro.csv"
+    return response
