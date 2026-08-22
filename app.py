@@ -15,7 +15,7 @@ DB_NAME = os.path.join(DATA_DIR, "controle_financeiro.db")
 app = FastAPI(title="Agente Financeiro IA")
 
 # ==========================================
-# 1. BANCO DE DADOS E INICIALIZAÇÃO
+# 1. BANCO DE DADOS E SEED AUTOMÁTICO
 # ==========================================
 
 def init_db() -> None:
@@ -32,25 +32,30 @@ def init_db() -> None:
                 );
             """)
             
+            # Popula o banco no Render/Local se estiver vazio
             cursor.execute("SELECT COUNT(*) FROM Valores;")
             if cursor.fetchone()[0] == 0:
-                dados_teste = [
-                    (date.today().isoformat(), "Salário Mensal", "receita", 5000.00),
-                    (date.today().isoformat(), "Supermercado", "despesa", 450.50),
-                    (date.today().isoformat(), "Conta de Luz", "despesa", 120.30)
+                dados_iniciais = [
+                    (date.today().isoformat(), "Salário Mensal", "receita", 6500.00),
+                    (date.today().isoformat(), "Projeto Freelance", "receita", 1200.00),
+                    (date.today().isoformat(), "Supermercado", "despesa", 680.40),
+                    (date.today().isoformat(), "Conta de Luz", "despesa", 145.20),
+                    (date.today().isoformat(), "Internet Fibra", "despesa", 119.90),
+                    (date.today().isoformat(), "Combustível", "despesa", 220.00),
+                    (date.today().isoformat(), "Restaurante", "despesa", 185.00)
                 ]
                 cursor.executemany("""
                     INSERT INTO Valores (data, descricao, tipo, valor)
                     VALUES (?, ?, ?, ?);
-                """, dados_teste)
+                """, dados_iniciais)
             conn.commit()
     except sqlite3.Error as e:
-        print(f"Erro no banco de dados: {e}")
+        print(f"Erro na inicialização do banco: {e}")
 
 init_db()
 
 # ==========================================
-# 2. FERRAMENTAS E MÉTODOS OPERACIONAIS
+# 2. METODOS OPERACIONAIS & FERRAMENTAS
 # ==========================================
 
 def consultar_controle(
@@ -117,6 +122,18 @@ def calculo(
         return {"status": "erro", "mensagem": str(e)}
 
 
+def deletar_registro(registro_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM Valores WHERE id = ?;", (registro_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.Error as e:
+        print(f"Erro ao deletar registro: {e}")
+        return False
+
+
 def calcular_saldo_final(
     data_inicio: Optional[date] = None,
     data_fim: Optional[date] = None
@@ -152,7 +169,6 @@ def calcular_saldo_final(
 
 
 def relatorio_por_categoria(tipo_filtro: str = 'despesa') -> List[Dict[str, Any]]:
-    """Gera o total consolidado agrupando por descrição para um determinado tipo."""
     try:
         with sqlite3.connect(DB_NAME) as conn:
             conn.row_factory = sqlite3.Row
@@ -166,11 +182,10 @@ def relatorio_por_categoria(tipo_filtro: str = 'despesa') -> List[Dict[str, Any]
             """, (tipo_filtro.lower(),))
             return [dict(row) for row in cursor.fetchall()]
     except sqlite3.Error as e:
-        print(f"Erro no relatório: {e}")
         return []
 
 # ==========================================
-# 3. ROTAS E INTERFACE WEB
+# 3. INTERFACE WEB E ROTAS FASTAPI
 # ==========================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -179,7 +194,7 @@ def home_ui():
     resumo = calcular_saldo_final()
     relatorio_despesas = relatorio_por_categoria('despesa')
     
-    # Tabela principal de lançamentos
+    # Tabela principal de lançamentos com opção de exclusão
     linhas_tabela = ""
     for r in registros:
         cor_badge = "bg-success" if r['tipo'] == 'receita' else "bg-danger"
@@ -191,10 +206,15 @@ def home_ui():
             <td>{r['descricao']}</td>
             <td><span class="badge {cor_badge}">{tipo_str}</span></td>
             <td>R$ {r['valor']:.2f}</td>
+            <td class="text-center">
+                <form action="/deletar/{r['id']}" method="post" style="display:inline;">
+                    <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Deseja excluir este registro?')">🗑️ Excluir</button>
+                </form>
+            </td>
         </tr>
         """
 
-    # Tabela do relatório por tipo de despesa
+    # Relatório de despesas
     linhas_relatorio = ""
     for item in relatorio_despesas:
         linhas_relatorio += f"""
@@ -213,37 +233,49 @@ def home_ui():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Controle Financeiro</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     </head>
     <body class="bg-light">
         <div class="container py-5">
-            <div class="d-flex justify-content-between align-items-center mb-4">
-                <h2>📊 Sistema de Controle Financeiro</h2>
-                <a href="/exportar-csv" class="btn btn-outline-success">📥 Exportar para CSV</a>
-            </div>
+            <h2 class="mb-4 text-center">📊 Sistema de Controle Financeiro</h2>
             
-            <!-- Cards de Saldo -->
-            <div class="row mb-4">
-                <div class="col-md-4">
-                    <div class="card text-white bg-success mb-3 shadow-sm">
-                        <div class="card-body">
-                            <h5 class="card-title">Receitas Totais</h5>
-                            <h3>R$ {resumo['total_receita']:.2f}</h3>
+            <!-- Cards de Saldo e Gráfico de Pizza -->
+            <div class="row mb-4 align-items-center">
+                <div class="col-md-7">
+                    <div class="row">
+                        <div class="col-12 mb-3">
+                            <div class="card text-white bg-success shadow-sm">
+                                <div class="card-body">
+                                    <h5 class="card-title">Receitas Totais</h5>
+                                    <h3>R$ {resumo['total_receita']:.2f}</h3>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-12 mb-3">
+                            <div class="card text-white bg-danger shadow-sm">
+                                <div class="card-body">
+                                    <h5 class="card-title">Despesas Totais</h5>
+                                    <h3>R$ {resumo['total_despesa']:.2f}</h3>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-12">
+                            <div class="card text-white bg-primary shadow-sm">
+                                <div class="card-body">
+                                    <h5 class="card-title">Saldo Final</h5>
+                                    <h3>R$ {resumo['saldo_final']:.2f}</h3>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
-                <div class="col-md-4">
-                    <div class="card text-white bg-danger mb-3 shadow-sm">
-                        <div class="card-body">
-                            <h5 class="card-title">Despesas Totais</h5>
-                            <h3>R$ {resumo['total_despesa']:.2f}</h3>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-4">
-                    <div class="card text-white bg-primary mb-3 shadow-sm">
-                        <div class="card-body">
-                            <h5 class="card-title">Saldo Final</h5>
-                            <h3>R$ {resumo['saldo_final']:.2f}</h3>
+                
+                <!-- Gráfico de Pizza (Chart.js) -->
+                <div class="col-md-5">
+                    <div class="card shadow-sm p-3 text-center">
+                        <h6 class="card-subtitle mb-2 text-muted">Proporção: Receitas x Despesas</h6>
+                        <div style="max-width: 280px; margin: 0 auto;">
+                            <canvas id="graficoPizza"></canvas>
                         </div>
                     </div>
                 </div>
@@ -256,7 +288,7 @@ def home_ui():
                     <form action="/adicionar" method="post" class="row g-3">
                         <div class="col-md-5">
                             <label class="form-label">Descrição</label>
-                            <input type="text" name="descricao" class="form-control" placeholder="Ex: Mercado, Aluguel..." required>
+                            <input type="text" name="descricao" class="form-control" placeholder="Ex: Mercado, Salário..." required>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">Valor (R$)</label>
@@ -279,15 +311,15 @@ def home_ui():
                 </div>
             </div>
 
-            <!-- Relatório Agrupado por Tipo de Despesa -->
+            <!-- Relatório por Categoria com Exportação CSV abaixo -->
             <div class="card mb-4 shadow-sm">
-                <div class="card-header bg-white"><strong>📉 Relatório Consolidação por Categoria de Despesa</strong></div>
+                <div class="card-header bg-white"><strong>📉 Relatório por Categoria de Despesa</strong></div>
                 <div class="card-body p-0">
                     <table class="table table-hover mb-0">
                         <thead class="table-light">
                             <tr>
                                 <th>Descrição / Categoria</th>
-                                <th>Quantidade de Lançamentos</th>
+                                <th>Qtd. Lançamentos</th>
                                 <th>Total Acumulado</th>
                             </tr>
                         </thead>
@@ -296,9 +328,12 @@ def home_ui():
                         </tbody>
                     </table>
                 </div>
+                <div class="card-footer bg-white text-end">
+                    <a href="/exportar-csv" class="btn btn-sm btn-outline-success">📥 Exportar Relatório para CSV</a>
+                </div>
             </div>
 
-            <!-- Tabela Geral de Extrato -->
+            <!-- Tabela Geral de Extrato com Exclusão -->
             <div class="card shadow-sm">
                 <div class="card-header bg-white"><strong>Extrato Completo</strong></div>
                 <div class="card-body p-0">
@@ -310,6 +345,7 @@ def home_ui():
                                 <th>Descrição</th>
                                 <th>Tipo</th>
                                 <th>Valor</th>
+                                <th class="text-center">Ação</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -319,6 +355,26 @@ def home_ui():
                 </div>
             </div>
         </div>
+
+        <script>
+            const ctx = document.getElementById('graficoPizza').getContext('2d');
+            new Chart(ctx, {{
+                type: 'pie',
+                data: {{
+                    labels: ['Receitas', 'Despesas'],
+                    datasets: [{{
+                        data: [{resumo['total_receita']}, {resumo['total_despesa']}],
+                        backgroundColor: ['#198754', '#dc3545']
+                    }}]
+                }},
+                options: {{
+                    responsive: true,
+                    plugins: {{
+                        legend: {{ position: 'bottom' }}
+                    }}
+                }}
+            }});
+        </script>
     </body>
     </html>
     """
@@ -331,25 +387,23 @@ def adicionar_registro(descricao: str = Form(...), valor: float = Form(...), tip
     return HTMLResponse(content="<script>window.location.href='/';</script>")
 
 
+@app.post("/deletar/{registro_id}")
+def deletar_registro_rota(registro_id: int):
+    deletar_registro(registro_id)
+    return HTMLResponse(content="<script>window.location.href='/';</script>")
+
+
 @app.get("/exportar-csv")
 def exportar_csv():
-    """Gera e faz o download automático de um arquivo CSV contendo todo o histórico."""
     registros = consultar_controle()
-    
     stream = io.StringIO()
     writer = csv.writer(stream, delimiter=';')
     
-    # Cabeçalho do arquivo CSV
     writer.writerow(["ID", "Data", "Descricao", "Tipo", "Valor (R$)"])
-    
     for r in registros:
         writer.writerow([r['id'], r['data'], r['descricao'], r['tipo'], f"{r['valor']:.2f}".replace('.', ',')])
         
     stream.seek(0)
-    
-    response = StreamingResponse(
-        iter([stream.getvalue()]),
-        media_type="text/csv"
-    )
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
     response.headers["Content-Disposition"] = "attachment; filename=extrato_financeiro.csv"
     return response
